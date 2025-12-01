@@ -112,6 +112,7 @@ Redis backend supports a **pool of persistent connections** and a short-lived **
 - **Apps**: `apps/ht_server_basic`, `apps/ht_client_cli` (for testing/demo)
 
 The sample apps are thin wrappers around `libht_server.a` / `libht_client.a` and can be used as a reference for integration.
+
 ---
 
 ## Configuration & CLI Flags (Essentials)
