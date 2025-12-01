@@ -172,8 +172,8 @@ sudo apt install -y build-essential pkg-config git \
 
 **Build:**
 ```bash
-git clone https://github.com/<you>/hashtransit.git
-cd hashtransit
+git clone https://github.com/Dookoo2/HashTransit-HT
+cd HashTransit-HT
 # 1) Server lib
 cd ht && make -j
 # 2) Client lib
