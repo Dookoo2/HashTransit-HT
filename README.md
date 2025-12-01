@@ -1,0 +1,298 @@
+# HashTransit (HT)
+
+HashTransit is a lightweight C++ library that solves the problem of secure machine-to-machine (M2M) communication in environments where standard mechanisms like TLS might be unavailable, overly complex, or insufficient for application-level control.
+
+**The Core Problem:** In IoT, internal microservices, and partner API scenarios, you often need guaranteed request authenticity and integrity, but may lack TLS termination capabilities or want additional application-layer security beyond what TLS provides.
+
+**The Solution:** HashTransit adds cryptographic signatures (HMAC), replay protection, and rate limiting to standard HTTP requests. Optionally, it can encrypt message bodies without TLS, providing confidentiality at the application level.
+
+**Typical Use Cases:**
+- **Internal Microservices:** When services communicate within a trusted network but require guaranteed authentication and audit trails.
+- **IoT & Embedded Devices:** For resource-constrained devices where full TLS handshakes are expensive, but message authenticity is critical.
+- **Partner APIs:** When exposing APIs to third parties that require strict key-based access control and abuse prevention.
+- **Defense in Depth:** Adding application-level authentication even when using TLS for additional security auditing.
+
+**Design Philosophy:** Simple, portable C++ with minimal dependencies; secure by default; operational clarity in logs and errors.
+
+---
+
+## Features at a Glance
+
+HashTransit provides a comprehensive toolkit for building secure communication:
+- **Cryptographic Authentication:** Every request is signed using HMAC-SHA256, ensuring message authenticity and integrity.
+- **Replay Attack Protection:** Unique nonces and timestamp validation prevent captured requests from being replayed.
+- **Multi-layer Rate Limiting:** Token-bucket rate limiting applied per IP address and per API key prevents DoS attacks and API abuse.
+- **Application-Level Encryption:** In Mode B, message bodies are encrypted using AEAD algorithms (AES-256-GCM or ChaCha20-Poly1305) providing confidentiality over plain HTTP.
+- **Flexible Key Management:** Pre-shared keys (PSK) can be stored in Redis (for distributed systems) or local files (for simpler deployments).
+- **Production-Ready Components:** Includes static libraries (`libht_server.a`, `libht_client.a`) for integration, plus CLI tools for testing and demonstration.
+- **Operational Safety:** Error redaction, secret-free logging, and header canonicalization prevent common security pitfalls.
+- **Three Security Modes:** Choose the right level of security for your environment—from authentication-only to full TLS with application-layer signing.
+
+
+---
+
+## Operating Modes
+
+- **Mode A — HTTP + HMAC**  
+  Authenticated requests; plaintext body. Best when confidentiality isn’t required but you still need **strong auth + replay defense**.
+
+- **Mode B — HTTP + HMAC + AEAD**  
+  Like Mode A, but the **body is encrypted** (headers remain visible). Useful when TLS termination is unavailable but you require **confidentiality**.
+
+- **Mode C — HTTPS (TLS) + HMAC**  
+  TLS secures the channel (PFS via TLS ciphers); HT adds **app-layer signing, replay protection, and per-key controls** for auditability and layered defense.
+
+---
+
+## How It Works (High-Level)
+
+### 1) Canonicalization & Signature (Client)
+The client constructs a **canonical string** from the HTTP request:
+- method, path (no fragment), normalized query (if present)  
+- a stable set of HT headers (lowercased/trimmed):  
+  `x-ht-keyid`, `x-ht-timestamp` (UTC ISO-8601), `x-ht-nonce` (≥96-bit random), and `x-ht-body-sha256` (hash of plaintext body)
+- body length/hash as applicable
+
+Then it computes:  
+`X-HT-Signature = HMAC-SHA256(PSK, canonical)`  
+…and attaches all HT headers to the HTTP request. In **Mode B**, the plaintext body is encrypted (see below), but the signature still covers the **canonical context**, binding headers and body together.
+
+### 2) AEAD (Mode B only)
+- Algorithms: **AES-256-GCM** or **ChaCha20-Poly1305**.  
+- **Directional keys** (`c2s`, `s2c`) are derived per request using an HKDF-like HMAC scheme with **domain separation** (alg, key_id, direction, timestamp).  
+- **Nonce**: 12 bytes (client supplies request nonce; server generates response nonce).  
+- **AAD**: the canonical string—so the ciphertext is authenticated against the exact request context.
+
+### 3) Server Validation Flow
+Upon receipt, the server:
+1. **Checks timestamp window** and **deduplicates (key_id, nonce)** to block replays.  
+2. Locates PSK by `key_id` via **Redis** (or file) and **verifies HMAC** over the same canonical string.  
+3. **Mode B**: decrypts body with derived key; recomputes and verifies `X-HT-Body-SHA256` **post-decrypt** (prevents mix-and-match).  
+4. Applies **per-IP and per-key rate limits**; rejects if exceeded.  
+5. Proceeds to application handler (e.g., `/echo`).  
+6. **Mode B**: encrypts response body with new **server-generated nonce**, sends `X-HT-AEAD-Nonce` back.
+
+Redis backend supports a **pool of persistent connections** and a short-lived **PSK cache** to minimize load. Values are stored as `<prefix><key_id> -> <psk_hex>` (32-byte PSK, 64 hex chars).
+
+---
+
+## Components
+
+- **Server library**: `ht/ → libht_server.a`  
+- **Client library**: `ht_cl/ → libht_client.a`  
+- **Apps**: `apps/ht_server_basic`, `apps/ht_client_cli` (for testing/demo)
+
+---
+
+## Configuration & CLI Flags (Essentials)
+### 1) Server: ht_server_basic
+| Flag                | Type                     | Req.                    | Mode(s) | Description                                                   | Default           |
+|---------------------|--------------------------|-------------------------|---------|---------------------------------------------------------------|-------------------|
+| `--mode`            | `` `A` \| `B` \| `C` ``  | ✅                      | A/B/C   | Operation mode selection                                      | —                 |
+| `--port`            | int                      | ✅                      | A/B/C   | TCP listen port                                               | —                 |
+| `--auth_file`       | path                     | see note                | A/B/C   | File-based auth backend (key_id → psk) when Redis is not used | —                 |
+| `--auth_redis`      | `` `0` \| `1` ``         | see note                | A/B/C   | Enable Redis auth backend (set to 1)                          | —                 |
+| `--redis_host`      | string                   | when `--auth_redis=1`   | A/B/C   | Redis host                                                    | `127.0.0.1`       |
+| `--redis_port`      | int                      | when `--auth_redis=1`   | A/B/C   | Redis port                                                    | `6379`            |
+| `--redis_db`        | int                      | when `--auth_redis=1`   | A/B/C   | Redis DB number                                               | `0`               |
+| `--redis_password`  | string                   | when `--auth_redis=1`   | A/B/C   | Redis password                                                | — (no password)   |
+| `--redis_prefix`    | string                   | when `--auth_redis=1`   | A/B/C   | Redis key prefix (e.g., `ht:key:`)                            | `ht:key:`         |
+| `--redis_pool`      | int                      | when `--auth_redis=1`   | A/B/C   | Redis connection pool size                                    | `8`               |
+| `--redis_timeout_ms`| int                      | when `--auth_redis=1`   | A/B/C   | Redis operation timeout in milliseconds                       | `200`             |
+| `--auth_cache_ttl`  | int                      | when `--auth_redis=1`   | A/B/C   | Authentication cache TTL in seconds                           | `60`              |
+| `--aead`            | `` `aesgcm` \| `chacha20` `` | ✅                  | B       | AEAD algorithm for body encryption                            | —                 |
+| `--tls_cert`        | path                     | ✅                      | C       | Server certificate (PEM)                                      | —                 |
+| `--tls_key`         | path                     | ✅                      | C       | Server private key (PEM)                                      | —                 |
+
+**Notes:**
+- Redis authentication requires `--auth_redis 1` to be set
+- All parameters with the `--redis_` prefix are only relevant when `--auth_redis=1`
+- `--auth_cache_ttl` controls the authentication cache TTL in seconds
+- `--redis_timeout_ms` sets the Redis operation timeout in milliseconds
+
+### 2) Client: ht_client_cli
+| Flag            | Type                     | Req.       | Mode(s) | Description                                        | Default |
+|-----------------|--------------------------|------------|---------|----------------------------------------------------|---------|
+| `--mode`        | `` `A` \| `B` \| `C` ``  | ✅         | A/B/C   | Operation mode selection                           | —       |
+| `--host`        | string                   | ✅         | A/B/C   | Server address                                     | —       |
+| `--port`        | int                      | ✅         | A/B/C   | Server port                                        | —       |
+| `--keyid`       | string                   | ✅         | A/B/C   | Key identifier (must exist on server backend)      | —       |
+| `--key`         | hex                      | ✅         | A/B/C   | 32-byte PSK in hex (64 chars)                      | —       |
+| `--path`        | string                   | ✅         | A/B/C   | HTTP path, e.g., `/echo`                           | —       |
+| `--data`        | string                   | if POST    | A/B/C   | Request body (demo `/echo` uses POST)              | —       |
+| `--aead`        | `` `aesgcm` \| `chacha20` `` | ✅         | B       | Must match server in mode B                        | —       |
+| `--tls_ca`      | path                     | ✅         | C       | CA / server cert for TLS verification              | —       |
+
+## Quick Start (Build & Test)
+
+**Dependencies (Ubuntu/Debian):**
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config git \
+    libssl-dev libhiredis-dev redis-server
+```
+
+**Build:**
+```bash
+git clone https://github.com/<you>/hashtransit.git
+cd hashtransit
+# 1) Server lib
+cd ht && make -j
+# 2) Client lib
+cd ../ht_cl && make -j
+# 3) Sample apps
+cd ../apps && make -j
+```
+
+**Redis & Keys:**
+```bash
+sudo systemctl enable --now redis-server
+redis-cli -n 0 SET ht:key:device-001 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+redis-cli -n 0 SET ht:key:device-002 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+```
+
+**Self-signed cert (for Mode C demo):**
+```bash
+cd apps
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout server.key -out server.crt -subj "/CN=localhost"
+```
+
+**Run server (choose a mode):**
+```bash
+# Mode A
+./ht_server_basic --mode A --port 8080 \
+  --auth_redis 1 --redis_host 127.0.0.1 --redis_port 6379 \
+  --redis_db 0 --redis_prefix "ht:key:" --redis_pool 4
+
+# Mode B
+./ht_server_basic --mode B --port 8081 --aead aesgcm \
+  --auth_redis 1 --redis_host 127.0.0.1 --redis_port 6379 \
+  --redis_db 0 --redis_prefix "ht:key:" --redis_pool 4
+
+# Mode C
+./ht_server_basic --mode C --port 8443 \
+  --tls_cert server.crt --tls_key server.key \
+  --auth_redis 1 --redis_host 127.0.0.1 --redis_port 6379 \
+  --redis_db 0 --redis_prefix "ht:key:" --redis_pool 4
+```
+
+**Send a request (matching mode):**
+```bash
+# Mode A
+./ht_client_cli --mode A --host 127.0.0.1 --port 8080 \
+  --keyid device-001 \
+  --key   0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --path /echo --data "hello-A"
+
+# Mode B
+./ht_client_cli --mode B --host 127.0.0.1 --port 8081 \
+  --keyid device-001 \
+  --key   0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --aead aesgcm \
+  --path /echo --data "hello-B"
+
+# Mode C
+./ht_client_cli --mode C --host 127.0.0.1 --port 8443 \
+  --keyid device-001 \
+  --key   0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --tls_ca server.crt \
+  --path /echo --data "hello-C"
+```
+
+**Results:**
+```bash
+# Mode A Server
+./ht_server_basic --mode A --port 8080 \
+  --auth_redis 1 --redis_host 127.0.0.1 --redis_port 6379 \
+  --redis_db 0 --redis_prefix "ht:key:" --redis_pool 4
+[AUTH] redis backend initialized: pool=4 host=127.0.0.1:6379 db=0 prefix=ht:key: cache_ttl=60s
+[INFO] HMAC-Transport server starting...
+[INFO] Mode: A
+[INFO] Port: 8080
+[INFO] Auth backend: REDIS host=127.0.0.1:6379 db=0 prefix=ht:key:
+[INFO] Anti-replay: nonce_ttl=600s, max_pending=100000
+[INFO] KA timeout=5s, KA max=100
+[INFO] Listening HTTP on :8080 mode=A
+[200] mode=A/C OK ip=127.0.0.1
+
+# Mode A Client
+./ht_client_cli --mode A --host 127.0.0.1 --port 8080 \
+  --keyid device-001 \
+  --key   0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --path /echo --data "hello-A"
+HTTP 200 OK
+Keep-Alive: timeout=5, max=100
+Connection: keep-alive
+Content-Length: 29
+Content-Type: application/json
+
+{"status":"OK","echo_size":7}
+
+# Mode B Server
+./ht_server_basic --mode B --port 8081 --aead aesgcm \
+  --auth_redis 1 --redis_host 127.0.0.1 --redis_port 6379 \
+  --redis_db 0 --redis_prefix "ht:key:" --redis_pool 4
+[AUTH] redis backend initialized: pool=4 host=127.0.0.1:6379 db=0 prefix=ht:key: cache_ttl=60s
+[INFO] HMAC-Transport server starting...
+[INFO] Mode: B
+[INFO] Port: 8081
+[INFO] Auth backend: REDIS host=127.0.0.1:6379 db=0 prefix=ht:key:
+[INFO] Anti-replay: nonce_ttl=600s, max_pending=100000
+[INFO] KA timeout=5s, KA max=100
+[INFO] Listening HTTP on :8081 mode=B
+[200] mode=B OK ip=127.0.0.1
+
+# Mode B Client
+./ht_client_cli --mode B --host 127.0.0.1 --port 8081 \
+  --keyid device-001 \
+  --key   0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --aead aesgcm \
+  --path /echo --data "hello-B"
+HTTP 200 OK
+Keep-Alive: timeout=5, max=100
+Connection: keep-alive
+Content-Length: 23
+X-HT-AEAD-Nonce: a99c506c71e8289dd97f59b9
+X-HT-AEAD: aesgcm
+Content-Type: application/octet-stream
+
+hello-B
+
+# Mode C Server
+./ht_server_basic --mode C --port 8443 \
+  --tls_cert server.crt --tls_key server.key \
+  --auth_redis 1 --redis_host 127.0.0.1 --redis_port 6379 \
+  --redis_db 0 --redis_prefix "ht:key:" --redis_pool 4
+[AUTH] redis backend initialized: pool=4 host=127.0.0.1:6379 db=0 prefix=ht:key: cache_ttl=60s
+[INFO] HMAC-Transport server starting...
+[INFO] Mode: C
+[INFO] Port: 8443
+[INFO] Auth backend: REDIS host=127.0.0.1:6379 db=0 prefix=ht:key:
+[INFO] Anti-replay: nonce_ttl=600s, max_pending=100000
+[INFO] KA timeout=5s, KA max=100
+[INFO] Listening HTTPS on :8443 mode=C
+[200] TLS mode=A/C OK ip=127.0.0.1
+
+# Mode C Client
+./ht_client_cli --mode C --host 127.0.0.1 --port 8443 \
+  --keyid device-001 \
+  --key   0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --tls_ca server.crt \
+  --path /echo --data "hello-C"
+HTTP 200 OK
+Keep-Alive: timeout=5, max=100
+Connection: keep-alive
+Content-Length: 29
+Content-Type: application/json
+
+{"status":"OK","echo_size":7}
+
+```
+
+**Error mapping:**
+- **401 Unauthorized with {"reason":"BAD_SIG"}:** wrong key/signature/timestamp/nonce;
+- **429 Too Many Requests:** rate limiting;
+- **404 Not Found:** wrong path;
+- **500 Internal error:** error without description.
+
