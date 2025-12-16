@@ -192,8 +192,7 @@ redis-cli -n 0 SET ht:key:device-002 fffffffffffffffffffffffffffffffffffffffffff
 **Self-signed cert (for Mode C demo):**
 ```bash
 cd apps
-openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -keyout server.key -out server.crt -subj "/CN=localhost"
+openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes   -keyout server.key -out server.crt   -subj "/CN=localhost"   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 ```
 
 **Run server (choose a mode):**
