@@ -202,11 +202,11 @@ void Server::nonce_gc_loop() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 
-        // NonceCache may implement lazy expiry on access; a light GC is OK.
-        // If your NonceCache has an explicit API (e.g., expire_older_than(ttl)),
-        // call it here. We keep it passive to avoid depending on internal API.
-        // Example (uncomment if available):
-        // _nonces.expire_older_than(std::chrono::seconds(_cfg.nonce_ttl_sec));
+        // Enforce TTL proactively. Without this, the cache only shrinks under
+        // pressure-based pruning, which makes memory usage spiky.
+        if (_cfg.nonce_ttl_sec > 0) {
+            _nonces.gc(_cfg.nonce_ttl_sec);
+        }
     }
 }
 
@@ -273,4 +273,3 @@ void Server::serve_tls() {
 }
 
 } // namespace ht
-
