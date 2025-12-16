@@ -18,19 +18,137 @@
 #include "ht/internal/aead.hpp"
 #include "ht/internal/time.hpp"
 #include "ht/internal/tls_cli_ctx.hpp"
-#include "ht/internal/http_low.hpp"  // NEW: shared TCP + HTTP response parser
+#include "ht/internal/http_low.hpp"  // shared TCP + HTTP response parser
 
 #include <openssl/ssl.h>
 #include <openssl/rand.h>
+#include <openssl/x509v3.h>
+#include <openssl/err.h>
 
 #include <sstream>
 #include <algorithm>
 #include <mutex>
 #include <memory>
-#include <vector>   // FIX: needed for std::vector in earlier code
+#include <vector>
+
+#include <chrono>
+#include <limits>
+#include <cstring>
+
+#include <poll.h>
+#include <cerrno>
+#include <fcntl.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
+
+namespace {
+
+// Returns remaining milliseconds until deadline, clamped to [0, INT_MAX].
+[[nodiscard]] inline int remaining_ms(std::chrono::steady_clock::time_point deadline) noexcept {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    if (now >= deadline) return 0;
+    const auto ms = duration_cast<milliseconds>(deadline - now).count();
+    if (ms <= 0) return 0;
+    if (ms > static_cast<long long>(std::numeric_limits<int>::max())) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(ms);
+}
+
+// Drain OpenSSL error stack into logs.
+inline void log_openssl_errors(const char* where) {
+    unsigned long e = 0;
+    while ((e = ::ERR_get_error()) != 0) {
+        char buf[256];
+        ::ERR_error_string_n(e, buf, sizeof(buf));
+        ht::log_line(std::string("[CLIENT] ") + where + ": " + buf);
+    }
+}
+
+// Robust TLS handshake that handles WANT_READ/WANT_WRITE and bounded deadline.
+// Works with both blocking and non-blocking sockets.
+[[nodiscard]] bool ssl_connect_with_deadline(SSL* ssl, int fd, int timeout_sec) {
+    if (!ssl || fd < 0) return false;
+
+    const int effective_timeout = std::max(1, timeout_sec);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(effective_timeout);
+
+    while (true) {
+        ::ERR_clear_error();
+        const int rc = ::SSL_connect(ssl);
+        if (rc == 1) {
+            return true;
+        }
+
+        const int ssl_err = ::SSL_get_error(ssl, rc);
+
+        // OpenSSL handshake requires more I/O.
+        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+            const short ev = (ssl_err == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
+            const int ms = remaining_ms(deadline);
+            if (ms <= 0) {
+                ht::log_line("[CLIENT] SSL_connect timeout");
+                return false;
+            }
+            pollfd pfd{};
+            pfd.fd = fd;
+            pfd.events = ev;
+            int pr = 0;
+            do {
+                pr = ::poll(&pfd, 1, ms);
+            } while (pr < 0 && errno == EINTR);
+
+            if (pr <= 0) {
+                ht::log_line("[CLIENT] SSL_connect poll() timeout or error");
+                return false;
+            }
+            continue;
+        }
+
+        // Underlying socket error.
+        if (ssl_err == SSL_ERROR_SYSCALL) {
+            const int e = errno;
+            if (e == EINTR) {
+                continue;
+            }
+            if (e == EAGAIN || e == EWOULDBLOCK) {
+                // Treat as transient. Wait for readability and retry.
+                const int ms = remaining_ms(deadline);
+                if (ms <= 0) {
+                    ht::log_line("[CLIENT] SSL_connect timeout (EAGAIN)");
+                    return false;
+                }
+                pollfd pfd{};
+                pfd.fd = fd;
+                pfd.events = POLLIN;
+                int pr = 0;
+                do {
+                    pr = ::poll(&pfd, 1, ms);
+                } while (pr < 0 && errno == EINTR);
+                if (pr <= 0) {
+                    ht::log_line("[CLIENT] SSL_connect poll() timeout (EAGAIN)");
+                    return false;
+                }
+                continue;
+            }
+
+            ht::log_line(std::string("[CLIENT] SSL_connect syscall error: errno=") + std::to_string(e) +
+                         " (" + std::strerror(e) + ")");
+            log_openssl_errors("SSL_connect");
+            return false;
+        }
+
+        // Protocol / certificate / other SSL-layer error.
+        ht::log_line(std::string("[CLIENT] SSL_connect failed: ssl_error=") + std::to_string(ssl_err));
+        log_openssl_errors("SSL_connect");
+        return false;
+    }
+}
+
+} // namespace
 
 namespace ht {
 
@@ -100,24 +218,93 @@ struct Client::Impl {
             SSL_set_fd(s, plain->fd());
             const std::string sni = cfg.tls_sni.empty() ? cfg.host : cfg.tls_sni;
             SSL_set_tlsext_host_name(s, sni.c_str());
-            if (SSL_connect(s) <= 0) {
+
+            // IMPORTANT: certificate chain validation is not enough.
+            // Hostname/IP verification must be explicitly configured.
+            // This is only applied when tls_verify_peer=true.
+            if (cfg.tls_verify_peer) {
+                X509_VERIFY_PARAM* param = SSL_get0_param(s);
+                if (!param) {
+                    SSL_free(s);
+                    plain->close();
+                    plain.reset();
+                    ht::log_line("[CLIENT] SSL_get0_param failed");
+                    return false;
+                }
+
+                // If the expected name is an IP literal, verify against IP SAN.
+                // Otherwise verify against DNS name (supports wildcards as per OpenSSL rules).
+                unsigned char tmp[16];
+                const bool is_ipv4 = (::inet_pton(AF_INET, sni.c_str(), tmp) == 1);
+                const bool is_ipv6 = (!is_ipv4 && (::inet_pton(AF_INET6, sni.c_str(), tmp) == 1));
+                if (is_ipv4 || is_ipv6) {
+                    if (X509_VERIFY_PARAM_set1_ip_asc(param, sni.c_str()) != 1) {
+                        SSL_free(s);
+                        plain->close();
+                        plain.reset();
+                        ht::log_line("[CLIENT] X509_VERIFY_PARAM_set1_ip_asc failed");
+                        return false;
+                    }
+                } else {
+                    if (SSL_set1_host(s, sni.c_str()) != 1) {
+                        SSL_free(s);
+                        plain->close();
+                        plain.reset();
+                        ht::log_line("[CLIENT] SSL_set1_host failed");
+                        return false;
+                    }
+                }
+            }
+
+            // Perform TLS handshake in non-blocking mode with a bounded deadline.
+            // This avoids rare failures caused by treating SSL_ERROR_WANT_* as fatal.
+            const int fd = plain->fd();
+            const int old_flags = ::fcntl(fd, F_GETFL, 0);
+            if (old_flags < 0 || ::fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) < 0) {
                 SSL_free(s);
                 plain->close();
                 plain.reset();
-                ht::log_line("[CLIENT] SSL_connect failed");
+                ht::log_line("[CLIENT] fcntl(O_NONBLOCK) failed");
                 return false;
             }
+
+            const int handshake_timeout_sec = std::max(5, cfg.connect_timeout_sec);
+            const bool hs_ok = ssl_connect_with_deadline(s, fd, handshake_timeout_sec);
+
+            // Restore original socket flags (typically back to blocking mode).
+            (void)::fcntl(fd, F_SETFL, old_flags);
+
+            if (!hs_ok) {
+                SSL_free(s);
+                plain->close();
+                plain.reset();
+                return false;
+            }
+
+            // Enforce verification result explicitly.
+            if (cfg.tls_verify_peer) {
+                const long vr = SSL_get_verify_result(s);
+                if (vr != X509_V_OK) {
+                    SSL_free(s);
+                    plain->close();
+                    plain.reset();
+                    ht::log_line(std::string("[CLIENT] TLS verify failed: ") + X509_verify_cert_error_string(vr));
+                    return false;
+                }
+            }
+
             ssl.reset(s);
             served_on_conn = 0;
             return true;
-        } else {
-            if (plain && served_on_conn < cfg.ka_max) return true;
-            if (plain) { plain->close(); plain.reset(); }
-            plain = std::make_unique<internal::TcpConn>();
-            if (!plain->open(cfg)) { plain.reset(); return false; }
-            served_on_conn = 0;
-            return true;
         }
+
+        // Plain HTTP
+        if (plain && served_on_conn < cfg.ka_max) return true;
+        if (plain) { plain->close(); plain.reset(); }
+        plain = std::make_unique<internal::TcpConn>();
+        if (!plain->open(cfg)) { plain.reset(); return false; }
+        served_on_conn = 0;
+        return true;
     }
 
     bool send_all_locked(const std::string& data) {
@@ -130,9 +317,8 @@ struct Client::Impl {
                 off += (std::size_t)n;
             }
             return true;
-        } else {
-            return plain->send_all(data.data(), data.size());
         }
+        return plain->send_all(data.data(), data.size());
     }
 
     bool recv_response_locked(HttpResponse& out) {
@@ -168,10 +354,12 @@ struct Client::Impl {
             std::size_t have = head.size() - hdr_end_off;
             out.body.assign(p, p + std::min(have, content_len));
         }
+
         while (out.body.size() < content_len) {
             char buf[4096];
-            std::size_t need = content_len - out.body.size();
+            const std::size_t need = content_len - out.body.size();
             int n = 0;
+
             if (cfg.mode == Mode::TlsTube) {
                 n = SSL_read(ssl.get(), buf, std::min<std::size_t>(sizeof(buf), need));
                 if (n <= 0) { (void)SSL_get_error(ssl.get(), n); return false; }
@@ -183,8 +371,9 @@ struct Client::Impl {
         }
 
         const std::string conn = internal::lower_copy(internal::hdr_ci(out.headers, "Connection"));
-        bool do_close = (conn == "close");
+        const bool do_close = (conn == "close");
         served_on_conn++;
+
         if (do_close || served_on_conn >= cfg.ka_max) {
             close_conn_locked();
         }
@@ -221,8 +410,8 @@ bool Client::request(const std::string& method,
     // Sign canonical
     std::string mac_bin;
     if (!internal::hmac_sha256_bin(_p->secret_bin, canonical, mac_bin)) return false;
-    const std::string sig_hex = internal::bytes_to_hex(
-        (const unsigned char*)mac_bin.data(), mac_bin.size());
+    const std::string sig_hex =
+        internal::bytes_to_hex((const unsigned char*)mac_bin.data(), mac_bin.size());
 
     // Build request start-line and headers
     const std::string qstring = qcanon.empty() ? "" : ("?" + qcanon);
@@ -253,12 +442,14 @@ bool Client::request(const std::string& method,
         if (!internal::derive_aead_key_32(_p->secret_bin, aead_alg, ts, _p->cfg.key_id, "c2s", key32)) {
             return false;
         }
+
         std::string ct;
         if (!internal::aead_encrypt_body(ct, plaintext_body, aead_alg, key32, req_nonce12_bin, canonical)) {
             internal::secure_wipe(key32);
             return false;
         }
         internal::secure_wipe(key32);
+
         wire_body.swap(ct);
         req << "X-HT-AEAD: " << aead_alg << "\r\n";
         req << "X-HT-AEAD-Nonce: " << req_nonce12_hex << "\r\n";
@@ -273,27 +464,27 @@ bool Client::request(const std::string& method,
 
     const std::string head = req.str();
     if (!_p->send_all_locked(head)) return false;
-    if (!wire_body.empty()) if (!_p->send_all_locked(wire_body)) return false;
+    if (!wire_body.empty()) {
+        if (!_p->send_all_locked(wire_body)) return false;
+    }
 
     // Receive and parse response
     if (!_p->recv_response_locked(out)) return false;
 
     // AEAD response decryption (mode B): derive s2c with same ts/key_id
     if (_p->cfg.mode == Mode::AuthAead) {
-        const std::string aead_alg = internal::lower_copy(
-            internal::hdr_ci(out.headers, "X-HT-AEAD"));
-        const std::string resp_nonce_hex =
-            internal::hdr_ci(out.headers, "X-HT-AEAD-Nonce");
+        const std::string aead_alg = internal::lower_copy(internal::hdr_ci(out.headers, "X-HT-AEAD"));
+        const std::string resp_nonce_hex = internal::hdr_ci(out.headers, "X-HT-AEAD-Nonce");
         if (aead_alg != "chacha20" && aead_alg != "aesgcm") return false;
 
         std::string resp_nonce12;
-        if (!internal::hex_to_bytes(resp_nonce_hex, resp_nonce12) || resp_nonce12.size()!=12)
-            return false;
+        if (!internal::hex_to_bytes(resp_nonce_hex, resp_nonce12) || resp_nonce12.size() != 12) return false;
 
         std::string key32_s2c;
         if (!internal::derive_aead_key_32(_p->secret_bin, aead_alg, ts, _p->cfg.key_id, "s2c", key32_s2c)) {
             return false;
         }
+
         std::string pt;
         if (!internal::aead_decrypt_body(pt, out.body, aead_alg, key32_s2c, resp_nonce12, canonical)) {
             internal::secure_wipe(key32_s2c);
@@ -311,4 +502,3 @@ bool Client::post_echo(const std::string& payload, HttpResponse& out) {
 }
 
 } // namespace ht
-
