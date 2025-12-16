@@ -364,5 +364,22 @@ HashTransit is currently in **beta**: the protocol and APIs are stable enough fo
 internal and PoC deployments. We still reserve the right to make minor breaking
 changes before a 1.0 release.
 
+## Version
+**v0.2.0 - Changelog**  
+
+Client  
+- **Made TLS handshake robust:** SSL_connect() now retries on SSL_ERROR_WANT_READ/WRITE using poll() with a deadline (removes intermittent timing-related failures).  
+- **Added proper hostname/IP verification (not just SSL_VERIFY_PEER):** verifies 127.0.0.1 via IP SAN and localhost via DNS SAN (for tests).  
+- **Improved diagnostics:** logs the OpenSSL error stack on failures (e.g. certificate verify failed) instead of a generic SSL_connect failed.  
+
+Server  
+- **Hardened anti-replay:** insert (key_id|nonce) into NonceCache only after successful HMAC verification to prevent unauthenticated cache-filling DoS.    
+- **Enforced nonce TTL:** background GC actively purges expired nonces on a timer (not only under capacity pressure).    
+- **Strict nonce/header:** added strict nonce/header sanity limits to prevent header abuse and unbounded canonicalization/cache growth.
+- **Fixed FD leak:** Fixed FD leak in plain HTTP: connection handler now always close(fd) to avoid descriptor exhaustion.  
+
+**v0.1.0 - Release**
+
+
 ## License
 Apache-2.0
