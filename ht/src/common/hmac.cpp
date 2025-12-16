@@ -88,8 +88,13 @@ VerifyResult verify_request_common(const ht::HttpRequest& R,
     const std::string body_h  = hdr_ci(R, "X-HT-Body-SHA256");
     const std::string sig_hex = hdr_ci(R, "X-HT-Signature");
 
+    // NOTE: Put a strict upper bound on nonce length to prevent header abuse
+    // and unbounded growth of the anti-replay cache key material.
+    constexpr std::size_t kMaxNonceLen = 128;
+
     if (version != "1" || key_id.empty() || ts_s.empty() ||
-        nonce.size() < 8 || body_h.size() != 64 || sig_hex.size() != 64)
+        nonce.size() < 8 || nonce.size() > kMaxNonceLen ||
+        body_h.size() != 64 || sig_hex.size() != 64)
     {
         vr.reason = "BAD_AUTH_FIELDS";
         return vr;
@@ -107,15 +112,6 @@ VerifyResult verify_request_common(const ht::HttpRequest& R,
     if (std::llabs(now_s - ts_epoch) > cfg.ts_skew_sec) {
         vr.reason = "TS_SKEW";
         return vr;
-    }
-
-    // anti-replay
-    {
-        const std::string k = key_id + "|" + nonce;
-        if (!nonces.insert_if_absent(k, cfg.nonce_ttl_sec, cfg.max_pending)) {
-            vr.reason = "REPLAY_OR_OVER_CAPACITY";
-            return vr;
-        }
     }
 
     // key lookup
@@ -161,6 +157,18 @@ VerifyResult verify_request_common(const ht::HttpRequest& R,
         return vr;
     }
 
+    // anti-replay (insert only after successful authentication)
+    // This prevents trivial DoS where an attacker fills the nonce cache with
+    // random (key_id|nonce) pairs without knowing a valid key.
+    {
+        const std::string k = key_id + "|" + nonce;
+        if (!nonces.insert_if_absent(k, cfg.nonce_ttl_sec, cfg.max_pending)) {
+            secure_wipe(key_bin);
+            vr.reason = "REPLAY_OR_OVER_CAPACITY";
+            return vr;
+        }
+    }
+
     if (verify_plain_body_hash) {
         const std::string body_sha = sha256_hex(R.body);
         if (!ct_equal_hex(body_sha, body_h)) {
@@ -178,4 +186,3 @@ VerifyResult verify_request_common(const ht::HttpRequest& R,
 }
 
 } // namespace ht::internal
-
